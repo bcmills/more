@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 //go:build go1.18
+// +build go1.18
 
 package morebytes_test
 
@@ -10,12 +11,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math/rand"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	"github.com/bcmills/more/morebytes"
 	"github.com/bcmills/more/moreio"
+	"golang.org/x/sync/errgroup"
 )
 
 // A bufferFile mimics a subset of the behavior of a File using a bytes.Buffer
@@ -299,6 +302,48 @@ func FuzzFileRead(f *testing.F) {
 					t.Fatalf("Contents not equal.\n%T:\t%q\n%T:\t%q", r1, buf1[:n], r2, buf2[:n])
 				}
 			}
+		}
+	})
+}
+
+func FuzzFileConcurrentWriteAt(f *testing.F) {
+	f.Add(bytes.Repeat([]byte("Hello, playground!"), 1000), int64(4))
+
+	f.Fuzz(func(t *testing.T, in []byte, randSeed int64) {
+		w := new(morebytes.File)
+
+		var (
+			nextOffset = 0
+			mr         = rand.New(rand.NewSource(randSeed))
+			g          errgroup.Group
+		)
+		for nextOffset < len(in) {
+			offset := nextOffset
+			n := mr.Intn(len(in))
+			if n > len(in)-nextOffset {
+				nextOffset = len(in)
+			} else {
+				nextOffset += n
+			}
+			p := in[offset:nextOffset]
+
+			g.Go(func() error {
+				n, err := w.WriteAt(p, int64(offset))
+				if err != nil {
+					return err
+				}
+				if n != len(p) {
+					return io.ErrShortWrite
+				}
+				return nil
+			})
+		}
+
+		if err := g.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(w.Bytes(), in) {
+			t.Fatal("Final contents differ.")
 		}
 	})
 }

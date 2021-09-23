@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("\xbe\xff4444444\xcf\xcf\xcf\xcf<@@@v")
+int64(115)
