@@ -300,22 +300,22 @@ func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 	switch whence {
 	case io.SeekStart:
 		if offset < 0 {
-			return f.offset, errors.New("Seek: invalid offset")
+			return 0, errors.New("Seek: invalid offset")
 		}
 		abs = offset
 	case io.SeekCurrent:
 		if offset < -int64(f.offset) {
-			return f.offset, errors.New("Seek: invalid offset")
+			return 0, errors.New("Seek: invalid offset")
 		}
 		abs = int64(f.offset) + offset
 	case io.SeekEnd:
 		size := f.Size()
 		if offset < -size {
-			return f.offset, errors.New("Seek: invalid offset")
+			return 0, errors.New("Seek: invalid offset")
 		}
 		abs = size + offset
 	default:
-		return f.offset, errors.New("Seek: invalid whence")
+		return 0, errors.New("Seek: invalid whence")
 	}
 
 	// We already checked that the offset should not be negative through

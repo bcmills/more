@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
@@ -97,17 +98,19 @@ func FuzzFixedFileWrite(f *testing.F) {
 		b2 := make([]byte, bLen, bCap)
 		w2 := newAwkwardWriter(b2)
 
+		doWrite := func(b []byte) {
+			n1, err1 := w1.Write(b)
+			t.Logf("%T:\tWrite(%d bytes) = %v, %v", w1, len(b), n1, err1)
+			n2, err2 := w2.Write(b)
+			if n1 != n2 || (err1 != err2 && len(b) > 0) {
+				t.Fatalf("%T:\tWrite(%d bytes) = %v, %v", w2, len(b), n2, err2)
+			}
+		}
+
 		for _, b := range bytes.Split(in, []byte{0}) {
 			switch {
 			case len(b) == 0:
-				fallthrough
-			default:
-				n1, err1 := w1.Write(b)
-				t.Logf("%T:\tWrite(%d bytes) = %v, %v", w1, len(b), n1, err1)
-				n2, err2 := w2.Write(b)
-				if n1 != n2 || (err1 != err2 && len(b) > 0) {
-					t.Fatalf("%T:\tWrite(%d bytes) = %v, %v", w2, len(b), n2, err2)
-				}
+				doWrite(b)
 
 			case len(b) == 1:
 				c := b[0]
@@ -135,6 +138,9 @@ func FuzzFixedFileWrite(f *testing.F) {
 				if n2 != n1 || err2 != err1 {
 					t.Fatalf("%T:\tWriteString(%d bytes) = %v, %v", w2, len(s), n2, err2)
 				}
+
+			default:
+				doWrite(b)
 			}
 
 			if c1, c2 := w1.Cap(), w2.Cap(); c2 != c1 {
@@ -152,6 +158,8 @@ func FuzzFixedFileWrite(f *testing.F) {
 
 func FuzzFileRead(f *testing.F) {
 	f.Fuzz(func(t *testing.T, in, opBytes []byte) {
+		t.Logf("reading: %q", in)
+
 		r1 := morebytes.NewFile(in)
 		buf1 := make([]byte, 1<<16)
 		r2 := bytes.NewReader(in)
@@ -169,14 +177,29 @@ func FuzzFileRead(f *testing.F) {
 			} else if err != nil {
 				t.Fatal(err)
 			}
+
 			switch string(op[:]) {
 			case "s0":
+				fallthrough
 			case "s1":
+				fallthrough
 			case "s2":
+				var offset int16
+				binary.Read(ops, binary.LittleEndian, &offset)
+				whence := int(op[1] - '0')
+
+				off1, err1 := r1.Seek(int64(offset), whence)
+				t.Logf("%T\tSeek(%v, %v): %v, %v", r1, offset, whence, off1, err1)
+
+				off2, err2 := r2.Seek(int64(offset), whence)
+				if off2 != off1 || (err2 == nil) != (err1 == nil) {
+					t.Fatalf("%T\tSeek(%v, %v): %v, %v", r2, offset, whence, off2, err2)
+				}
 
 			case "rb":
 				c1, err1 := r1.ReadByte()
 				t.Logf("%T:\tReadByte(): %q, %v", r1, c1, err1)
+
 				c2, err2 := r2.ReadByte()
 				if c2 != c1 || err2 != err1 {
 					t.Fatalf("%T:\tReadByte(): %q, %v", r2, c2, err2)
@@ -185,6 +208,7 @@ func FuzzFileRead(f *testing.F) {
 			case "rr":
 				c1, n1, err1 := r1.ReadRune()
 				t.Logf("%T:\tReadRune(): %q, %v, %v", r1, c1, n1, err1)
+
 				c2, n2, err2 := r2.ReadRune()
 				if c2 != c1 || n2 != n1 || err2 != err1 {
 					t.Fatalf("%T:\tReadByte(): %q, %v, %v", r2, c2, n2, err2)
@@ -196,38 +220,81 @@ func FuzzFileRead(f *testing.F) {
 			case "ub":
 				err1 := r1.UnreadByte()
 				t.Logf("%T:\tUnreadByte(): %v", r1, err1)
+
 				err2 := r2.UnreadByte()
 				if (err2 == nil) != (err1 == nil) {
 					t.Fatalf("%T:\tUnreadByte(): %v", r2, err2)
 				}
 
 			case "ur":
-				if !afterReadRune {
-					c1, n1, err1 := r1.ReadRune()
-					t.Logf("%T:\tReadRune(): %q, %v, %v", r1, c1, n1, err1)
-					c2, n2, err2 := r2.ReadRune()
-					if c2 != c1 || n2 != n1 || err2 != err1 {
-						t.Fatalf("%T:\tReadByte(): %q, %v, %v", r2, c2, n2, err2)
-					}
-					if err1 != nil {
-						continue // Not after a successful ReadRune.
-					}
-				}
 				err1 := r1.UnreadRune()
 				t.Logf("%T:\tUnreadRune(): %v", r1, err1)
+
 				err2 := r2.UnreadRune()
 				if (err2 == nil) != (err1 == nil) {
-					t.Fatalf("%T:\tUnreadRune(): %v", r2, err2)
+					if err1 != nil || afterReadRune {
+						t.Fatalf("%T:\tUnreadRune(): %v", r2, err2)
+					}
+
+					// bytes.Reader allows UnreadRune only immediately after a successful
+					// ReadRune. File instead allows UnreadRune to Seek back by the length
+					// of one rune, so if bytes.Reader fails, use ReadRune to figure out
+					// the length and Seek to adjust the offset.
+
+					t.Logf("%T:\tUnreadRune(): %v", r2, err2)
+					c1, n1, err1 := r1.ReadRune()
+					if err1 != nil || n1 <= 0 {
+						t.Fatalf("%T: ReadRune(): %c, %v, %v", r1, c1, n1, err1)
+					}
+					if err := r1.UnreadRune(); err != nil {
+						t.Fatalf("%T: UnreadRune(): %v", r1, err)
+					}
+					_, err2 = r2.Seek(int64(-n1), io.SeekCurrent)
+					t.Logf("%T: Seek(%v, io.SeekCurrent): _, %v", r2, -n1, err2)
+					if err2 != nil {
+						t.FailNow()
+					}
+				}
+
+			case "wt":
+				out1 := new(strings.Builder)
+				n1, err1 := r1.WriteTo(out1)
+				t.Logf("%T:\tWriteTo(_): %v, %v", r1, n1, err1)
+
+				out2 := new(strings.Builder)
+				n2, err2 := r2.WriteTo(out2)
+				if n2 != n1 || err2 != err1 {
+					t.Fatalf("%T:\tWriteTo(_): %v, %v", r2, n2, err2)
+				}
+
+				if out2.String() != out1.String() {
+					t.Fatalf("Contents not equal.\n%T\t%q\n%T:\t%q", r1, out1, r2, out2)
+				}
+
+			case "ra":
+				var n, offset uint16
+				binary.Read(ops, binary.LittleEndian, &n)
+				binary.Read(ops, binary.LittleEndian, &offset)
+
+				n1, err1 := r1.ReadAt(buf1[:n], int64(offset))
+				t.Logf("%T:\tReadAt(<%d bytes>, %d): %v, %v", r1, n, offset, n1, err1)
+
+				n2, err2 := r2.ReadAt(buf2[:n], int64(offset))
+				if n2 != n1 || (err2 == nil) != (err1 == nil) {
+					t.Fatalf("%T:\tReadAt(<%d bytes>, %d): %v, %v", r1, n, offset, n1, err1)
 				}
 
 			default:
 				n := binary.LittleEndian.Uint16(op[:])
+
 				n1, err1 := r1.Read(buf1[:n])
 				t.Logf("%T:\tRead(_[:%d]): %v, %v", r1, n, n1, err1)
+
 				n2, err2 := r2.Read(buf2[:n])
 				if n2 != n1 || err2 != err1 {
 					t.Fatalf("%T:\tRead(_[:%d]): %v, %v", r2, n, n2, err2)
 				}
+
 				if !bytes.Equal(buf1[:n], buf2[:n]) {
 					t.Fatalf("Contents not equal.\n%T:\t%q\n%T:\t%q", r1, buf1[:n], r2, buf2[:n])
 				}
