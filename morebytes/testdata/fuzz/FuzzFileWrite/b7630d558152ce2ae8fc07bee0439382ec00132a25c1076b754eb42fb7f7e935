@@ -1,0 +1,4 @@
+go test fuzz v1
+int(8)
+int(19568)
+string("\xe6'\x00t")
