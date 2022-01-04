@@ -9,4 +9,4 @@ package moreexec
 
 import "os"
 
-var quitSignal = nil
+var quitSignal os.Signal = nil

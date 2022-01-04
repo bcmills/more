@@ -36,22 +36,18 @@ type Cmd struct {
 
 	// Context is the context that controls the lifetime of the command
 	// (typically the one passed to CommandContext).
-	//
-	// If Context is non-nil, a signal (os.Kill by default) will be sent
-	// to the child process when Context is done.
-	//
-	// The Context field must not be modified while the command is running.
 	Context context.Context
 
-	// If Interrupt is non-nil, Interrupt will be sent to the child process
-	// instead of os.Kill when Context is done.
+	// If Interrupt is non-nil, Context must also be non-nil and Interrupt will be
+	// sent to the child process when Context is done.
 	//
-	// (If Context is nil, Interrupt has no effect.)
+	// Setting Interrupt to os.Interrupt on Windows is not currently supported,
+	// but may send a CTRL_BREAK_EVENT in a future version.
 	Interrupt os.Signal
 
-	// If WaitDelay is nonzero, the command's I/O pipes will be closed after
+	// If WaitDelay is non-zero, the command's I/O pipes will be closed after
 	// WaitDelay has elapsed after either the command's process has exited or
-	// (if Context is non-nil) Context is done.
+	// (if Context is non-nil) Context is done, whichever occurs first.
 	//
 	// If the command's process is still running after WaitDelay has elapsed,
 	// it will be terminated with os.Kill before the pipes are closed.
@@ -86,6 +82,7 @@ func Command(name string, args ...string) *Cmd {
 func CommandContext(ctx context.Context, name string, args ...string) *Cmd {
 	c := Command(name, args...)
 	c.Context = ctx
+	c.Interrupt = os.Kill
 	return c
 }
 
@@ -94,6 +91,10 @@ func (c *Cmd) String() string {
 }
 
 func (c *Cmd) Start() (err error) {
+	if c.Interrupt != nil && c.Context == nil {
+		return errors.New("moreexec: Interrupt requires a non-nil Context")
+	}
+
 	if c.statec != nil {
 		return errors.New("moreexec: already started")
 	}
@@ -186,17 +187,19 @@ func (c *Cmd) Start() (err error) {
 }
 
 func (c *Cmd) wait(statec chan<- *os.ProcessState, cmd *exec.Cmd) {
-	ctx := c.Context
-	var cancel context.CancelFunc
-	if c.WaitDelay != 0 {
+	var (
+		cancel context.CancelFunc
+		errc   chan error
+	)
+	if c.Interrupt != nil || c.WaitDelay != 0 {
+		ctx := c.Context
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		ctx, cancel = context.WithCancel(ctx)
-	}
+		if c.WaitDelay != 0 {
+			ctx, cancel = context.WithCancel(ctx)
+		}
 
-	var errc chan error
-	if ctx != nil {
 		errc = make(chan error)
 		go func() {
 			select {
@@ -206,12 +209,8 @@ func (c *Cmd) wait(statec chan<- *os.ProcessState, cmd *exec.Cmd) {
 			}
 
 			err := ctx.Err()
-			if c.Context != nil {
-				interrupt := c.Interrupt
-				if interrupt == nil {
-					interrupt = os.Kill
-				}
-				if signalErr := c.Process.Signal(interrupt); signalErr != nil {
+			if c.Interrupt != nil {
+				if signalErr := c.Process.Signal(c.Interrupt); signalErr != nil {
 					if isProcessDone(signalErr) {
 						err = nil
 					} else {
