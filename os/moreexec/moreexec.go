@@ -34,27 +34,31 @@ type Cmd struct {
 	Process      *os.Process
 	ProcessState *os.ProcessState
 
-	// Ctx is the context that controls the lifetime of the command
+	// Context is the context that controls the lifetime of the command
 	// (typically the one passed to CommandContext).
 	//
-	// If Ctx is non-nil, a signal (os.Kill by default) will be sent
-	// to the child process when Ctx is done.
+	// If Context is non-nil, a signal (os.Kill by default) will be sent
+	// to the child process when Context is done.
 	//
-	// The Ctx field must not be modified while the command is running.
-	Ctx context.Context
+	// The Context field must not be modified while the command is running.
+	Context context.Context
 
 	// If Interrupt is non-nil, Interrupt will be sent to the child process
-	// instead of os.Kill when Ctx is done.
+	// instead of os.Kill when Context is done.
 	//
-	// (If Ctx is nil, Interrupt has no effect.)
+	// (If Context is nil, Interrupt has no effect.)
 	Interrupt os.Signal
 
 	// If WaitDelay is nonzero, the command's I/O pipes will be closed after
-	// WaitDelay has elapsed after either Ctx is done (if it is non-nil) or the
-	// command's process has exited (if Ctx is nil).
+	// WaitDelay has elapsed after either the command's process has exited or
+	// (if Context is non-nil) Context is done.
 	//
 	// If the command's process is still running after WaitDelay has elapsed,
 	// it will be terminated with os.Kill before the pipes are closed.
+	//
+	// If WaitDelay is zero (the default), I/O pipes will be read until EOF,
+	// which might not occur until orphaned subprocesses of the command have
+	// also closed their descriptors for the pipes.
 	WaitDelay time.Duration
 
 	statec <-chan *os.ProcessState
@@ -81,7 +85,7 @@ func Command(name string, args ...string) *Cmd {
 
 func CommandContext(ctx context.Context, name string, args ...string) *Cmd {
 	c := Command(name, args...)
-	c.Ctx = ctx
+	c.Context = ctx
 	return c
 }
 
@@ -182,10 +186,13 @@ func (c *Cmd) Start() (err error) {
 }
 
 func (c *Cmd) wait(statec chan<- *os.ProcessState, cmd *exec.Cmd) {
-	ctx := c.Ctx
+	ctx := c.Context
 	var cancel context.CancelFunc
-	if ctx == nil && c.WaitDelay != 0 {
-		ctx, cancel = context.WithCancel(context.Background())
+	if c.WaitDelay != 0 {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		ctx, cancel = context.WithCancel(ctx)
 	}
 
 	var errc chan error
@@ -199,7 +206,7 @@ func (c *Cmd) wait(statec chan<- *os.ProcessState, cmd *exec.Cmd) {
 			}
 
 			err := ctx.Err()
-			if c.Ctx != nil {
+			if c.Context != nil {
 				interrupt := c.Interrupt
 				if interrupt == nil {
 					interrupt = os.Kill
