@@ -6,7 +6,6 @@ package moreio
 
 import (
 	"io"
-	"unicode/utf8"
 )
 
 // A LimitedWriter writes to W but limits the amount of data written to just N
@@ -79,20 +78,10 @@ func (lw *LimitedWriter) WriteString(s string) (n int, err error) {
 }
 
 func (lw *LimitedWriter) WriteByte(c byte) error {
-	bw, ok := lw.W.(io.ByteWriter)
-	if !ok {
-		n, err := lw.Write([]byte{c})
-		if n < 1 && err == nil {
-			return io.ErrShortWrite
-		}
-		return err
-	}
-
 	if lw.N <= 0 {
 		return lw.err()
 	}
-
-	if err := bw.WriteByte(c); err != nil {
+	if err := WriteByte(lw.W, c); err != nil {
 		return err
 	}
 	lw.N--
@@ -100,12 +89,9 @@ func (lw *LimitedWriter) WriteByte(c byte) error {
 }
 
 func (lw *LimitedWriter) WriteRune(r rune) (n int, err error) {
-	type runeWriter interface {
-		WriteRune(rune) (int, error)
-	}
-	if rw, ok := lw.W.(runeWriter); ok && lw.N >= utf8.UTFMax {
-		// r is guarateed to fit, so let the wrapped runeWriter encode it.
-		n, err = rw.WriteRune(r)
+	if lw.N >= utfMax {
+		// r is guarateed to fit in lw.N, so use the WriteRune method if it is defined.
+		n, err = WriteRune(lw.W, r)
 		lw.N -= int64(n)
 		return n, err
 	}
@@ -113,8 +99,8 @@ func (lw *LimitedWriter) WriteRune(r rune) (n int, err error) {
 	// Either lw.W does not know how to encode runes, or the limit is tight and we
 	// need to encode r to see how big it actually is.
 
-	var arr [utf8.UTFMax]byte
-	size := utf8.EncodeRune(arr[:], r)
+	var arr [utfMax]byte
+	size := copy(arr[:], string(r))
 	if lw.N < int64(size) {
 		return 0, lw.err()
 	}
