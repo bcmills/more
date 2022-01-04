@@ -130,7 +130,7 @@ func (f *File) SizeLimit() int64 {
 // Size returns the current size of the File's data.
 //
 // The result can always be represented without overflow as an int:
-// Size returns an int64 only to mimic the API of os.File and bytes.Reader.
+// Size returns an int64 only to mimic the API of bytes.Reader.
 func (f *File) Size() int64 {
 	return int64(len(f.buf))
 }
