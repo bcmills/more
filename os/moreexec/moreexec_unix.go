@@ -7,6 +7,11 @@
 
 package moreexec
 
-import "syscall"
+import (
+	"os"
+	"syscall"
+)
 
-var quitSignal = syscall.SIGQUIT
+var quitSignal os.Signal = syscall.SIGQUIT
+
+var errWindows error = nil

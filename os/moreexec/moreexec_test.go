@@ -6,10 +6,12 @@ package moreexec_test
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strings"
@@ -30,11 +32,13 @@ var (
 func TestMain(m *testing.M) {
 	flag.Parse()
 
-	if *probe > 0 {
+	pid := os.Getpid()
+
+	if *probe != 0 {
 		ticker := time.NewTicker(*probe)
 		go func() {
 			for range ticker.C {
-				if _, err := fmt.Fprintln(os.Stderr, "ok"); err != nil {
+				if _, err := fmt.Fprintln(os.Stderr, pid, "ok"); err != nil {
 					os.Exit(1)
 				}
 			}
@@ -44,14 +48,27 @@ func TestMain(m *testing.M) {
 	if *subsleep != 0 {
 		exe, err := os.Executable()
 		if err != nil {
-			fmt.Println(err)
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 
-		cmd := moreexec.Command(exe, "-sleep", subsleep.String(), "-probe", "1ms")
-		cmd.Stdout = os.Stdout
+		cmd := moreexec.Command(exe, "-sleep", subsleep.String(), "-probe", probe.String())
 		cmd.Stderr = os.Stderr
+		out, err := cmd.StdoutPipe()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		cmd.Start()
+
+		buf := new(strings.Builder)
+		if _, err := io.Copy(buf, out); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			cmd.Process.Kill()
+			cmd.Wait()
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, pid, "started", cmd.Process.Pid)
 	}
 
 	if *sleep != 0 {
@@ -67,11 +84,14 @@ func TestMain(m *testing.M) {
 
 		select {
 		case <-time.After(*sleep):
-		case <-c:
+			fmt.Fprintln(os.Stderr, pid, "slept", *sleep)
+		case sig := <-c:
+			fmt.Fprintln(os.Stderr, pid, "received", sig)
 		}
 	}
 
 	if *probe != 0 || *subsleep != 0 || *sleep != 0 {
+		fmt.Fprintln(os.Stderr, pid, "exiting")
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
@@ -114,16 +134,16 @@ func start(t *testing.T, ctx context.Context, interrupt os.Signal, killDelay tim
 	return cmd
 }
 
-func TestWait(t *testing.T) {
-	ctx := context.Background()
-
+func TestWaitContext(t *testing.T) {
 	t.Run("Wait", func(t *testing.T) {
-		cmd := start(t, ctx, os.Interrupt, 0, "-sleep=1ms")
+		cmd := start(t, context.Background(), os.Kill, 0, "-sleep=1ms")
+		err := cmd.Wait()
+		t.Logf("stderr:\n%s", cmd.Stderr)
+		t.Logf("[%d] %v", cmd.Process.Pid, err)
 
-		if err := cmd.Wait(); err != nil {
+		if err != nil {
 			t.Errorf("Wait: %v; want <nil>", err)
 		}
-		t.Logf("stderr:\n%s", cmd.Stderr)
 		if ps := cmd.ProcessState; !ps.Exited() {
 			t.Errorf("cmd did not exit: %v", ps)
 		} else if code := ps.ExitCode(); code != 0 {
@@ -131,42 +151,91 @@ func TestWait(t *testing.T) {
 		}
 	})
 
-	t.Run("hang", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(ctx)
-		cmd := start(t, ctx, nil, 10*time.Millisecond, "-subsleep=1s", "-probe=1ms")
+	t.Run("WaitDelay", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skipf("skipping: os.Interrupt is not implemented on Windows")
+		}
 
+		ctx, cancel := context.WithCancel(context.Background())
+		cmd := start(t, ctx, nil, 10*time.Minute, "-sleep=10m", "-interrupt=true")
 		cancel()
-		if err := cmd.Wait(); err != ctx.Err() {
+
+		time.Sleep(1 * time.Millisecond)
+		cmd.Process.Signal(os.Interrupt)
+
+		err := cmd.Wait()
+		t.Logf("stderr:\n%s", cmd.Stderr)
+		t.Logf("[%d] %v", cmd.Process.Pid, err)
+
+		// This program exits with status 0,
+		// but pretty much always does so during the wait delay.
+		// Since the Cmd itself didn't do anything to stop the process when the
+		// context expired, a successful exit is valid (even though late) and does
+		// not merit a non-nil error.
+		if err != nil {
 			t.Errorf("Wait: %v; want %v", err, ctx.Err())
-			t.Logf("%v\n%s", cmd.Args, cmd.Stderr)
 		}
 		if ps := cmd.ProcessState; !ps.Exited() {
-			t.Errorf("cmd did not exit")
+			t.Errorf("cmd did not exit: %v", ps)
 		} else if code := ps.ExitCode(); code != 0 {
 			t.Errorf("cmd.ProcessState.ExitCode() = %v; want 0", code)
 		}
 	})
 
-	t.Run("SIGINT-ignored", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(ctx)
-		cmd := start(t, ctx, os.Interrupt, 100*time.Millisecond, "-sleep=10m", "-interrupt=false")
-
+	t.Run("SIGKILL-hang", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cmd := start(t, ctx, os.Kill, 10*time.Millisecond, "-sleep=10m", "-subsleep=10m", "-probe=1ms")
 		cancel()
 		err := cmd.Wait()
-		if err != ctx.Err() {
-			if runtime.GOOS == "windows" {
-				// We expect Wait with os.Interrupt to error out on Windows
-				// because Windows does not implement os.Interrupt.
-				t.Logf("Wait error = %v (as expected on Windows)", err)
-			} else {
-				t.Errorf("Wait error = %v; want %v", err, ctx.Err())
-			}
-		}
 		t.Logf("stderr:\n%s", cmd.Stderr)
+		t.Logf("[%d] %v", cmd.Process.Pid, err)
+
+		// This test should kill the child process after 10ms,
+		// leaving a grandchild process writing probes in a loop.
+		// The child process should be reported as failed,
+		// and the grandchild will exit (or die by SIGPIPE) once the
+		// stderr pipe is closed.
+		if ee := new(*exec.ExitError); !errors.As(err, ee) {
+			t.Errorf("Wait error = %v; want %T", err, *ee)
+		}
+	})
+
+	t.Run("Exit-hang", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cmd := start(t, ctx, nil, 10*time.Millisecond, "-subsleep=10m", "-probe=1ms")
+		cancel()
+		err := cmd.Wait()
+		t.Logf("stderr:\n%s", cmd.Stderr)
+		t.Logf("[%d] %v", cmd.Process.Pid, err)
+
+		// This child process should exit immediately,
+		// leaving a grandchild process writing probes in a loop.
+		// Since the child has no ExitError to report but we did not
+		// read all of its output, Wait should return ErrWaitDelay.
+		if !errors.Is(err, moreexec.ErrWaitDelay) {
+			t.Errorf("Wait error = %v; want %T", err, moreexec.ErrWaitDelay)
+		}
+	})
+
+	t.Run("SIGINT-ignored", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skipf("skipping: os.Interrupt is not implemented on Windows")
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cmd := start(t, ctx, os.Interrupt, 10*time.Millisecond, "-sleep=10m", "-interrupt=false")
+		cancel()
+		err := cmd.Wait()
+		t.Logf("stderr:\n%s", cmd.Stderr)
+		t.Logf("[%d] %v", cmd.Process.Pid, err)
+
+		// This command ignores SIGINT, sleeping until it is killed.
+		// Wait should return the usual error for a killed process.
+		if ee := new(*exec.ExitError); !errors.As(err, ee) {
+			t.Errorf("Wait error = %v; want %T", err, *ee)
+		}
 		if ps := cmd.ProcessState; ps.Exited() {
 			t.Errorf("cmd unexpectedly exited: %v", ps)
-		} else if ps.Success() {
-			t.Errorf("cmd.ProcessState.Success() = true; want false")
 		} else if sys, ok := ps.Sys().(interface{ Signal() syscall.Signal }); ok && sys.Signal() != os.Kill {
 			t.Errorf("cmd.ProcessState.Sys().Signal() = %v; want %v", sys.Signal(), os.Kill)
 		}
@@ -177,16 +246,16 @@ func TestWait(t *testing.T) {
 			t.Skipf("skipping: os.Interrupt is not implemented on Windows")
 		}
 
-		ctx, cancel := context.WithCancel(ctx)
+		ctx, cancel := context.WithCancel(context.Background())
 		cmd := start(t, ctx, os.Interrupt, 0, "-sleep=10m", "-interrupt=true")
-
 		cancel()
 		err := cmd.Wait()
-		if err != ctx.Err() {
+		t.Logf("stderr:\n%s", cmd.Stderr)
+		t.Logf("[%d] %v", cmd.Process.Pid, err)
+
+		if !errors.Is(err, ctx.Err()) {
 			t.Errorf("Wait error = %v; want %v", err, ctx.Err())
 		}
-		t.Logf("stderr:\n%s", cmd.Stderr)
-
 		if ps := cmd.ProcessState; !ps.Exited() {
 			t.Errorf("cmd did not exit: %v", ps)
 		} else if code := ps.ExitCode(); code != 0 {
@@ -195,19 +264,20 @@ func TestWait(t *testing.T) {
 	})
 
 	t.Run("SIGQUIT", func(t *testing.T) {
-		if moreexec.QuitSignal == os.Kill {
+		if moreexec.QuitSignal == nil {
 			t.Skipf("skipping: SIGQUIT is not supported on %v", runtime.GOOS)
 		}
 
-		ctx, cancel := context.WithCancel(ctx)
+		ctx, cancel := context.WithCancel(context.Background())
 		cmd := start(t, ctx, moreexec.QuitSignal, 0, "-sleep=10m")
-
 		cancel()
 		err := cmd.Wait()
-		if err != ctx.Err() {
+		t.Logf("stderr:\n%s", cmd.Stderr)
+		t.Logf("[%d] %v", cmd.Process.Pid, err)
+
+		if ee := new(*exec.ExitError); !errors.As(err, ee) {
 			t.Errorf("Wait error = %v; want %v", err, ctx.Err())
 		}
-		t.Logf("stderr:\n%s", cmd.Stderr)
 
 		if ps := cmd.ProcessState; !ps.Exited() {
 			t.Errorf("cmd did not exit: %v", ps)

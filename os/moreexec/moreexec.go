@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +21,8 @@ import (
 
 // QuitSignal is syscall.SIGQUIT if it is defined and supported, or nil otherwise.
 var QuitSignal os.Signal = quitSignal
+
+var ErrWaitDelay = errors.New("moreexec: WaitDelay expired before I/O complete")
 
 type Cmd struct {
 	Path         string
@@ -91,8 +94,13 @@ func (c *Cmd) String() string {
 }
 
 func (c *Cmd) Start() (err error) {
-	if c.Interrupt != nil && c.Context == nil {
-		return errors.New("moreexec: Interrupt requires a non-nil Context")
+	if c.Interrupt != nil {
+		if c.Context == nil {
+			return errors.New("moreexec: Interrupt requires a non-nil Context")
+		}
+		if runtime.GOOS == "windows" && c.Interrupt != os.Kill {
+			return fmt.Errorf("moreexec: signal %q: %w", c.Interrupt, errWindows)
+		}
 	}
 
 	if c.statec != nil {
@@ -208,14 +216,14 @@ func (c *Cmd) wait(statec chan<- *os.ProcessState, cmd *exec.Cmd) {
 			case <-ctx.Done():
 			}
 
-			err := ctx.Err()
+			var err error
 			if c.Interrupt != nil {
-				if signalErr := c.Process.Signal(c.Interrupt); signalErr != nil {
-					if isProcessDone(signalErr) {
-						err = nil
-					} else {
-						err = fmt.Errorf("moreexec: error sending signal to Cmd: %w", signalErr)
-					}
+				if signalErr := c.Process.Signal(c.Interrupt); signalErr == nil {
+					// We appear to have successfully delivered c.Interrupt, so any
+					// program behavior from this point may be due to ctx.
+					err = ctx.Err()
+				} else if !isProcessDone(signalErr) {
+					err = fmt.Errorf("moreexec: error sending signal to Cmd: %w", signalErr)
 				}
 			}
 
@@ -225,7 +233,6 @@ func (c *Cmd) wait(statec chan<- *os.ProcessState, cmd *exec.Cmd) {
 				case errc <- err:
 					timer.Stop()
 					return
-				// ...but after killDelay has elapsed, fall back to a stronger signal.
 				case <-timer.C:
 				}
 
@@ -235,10 +242,10 @@ func (c *Cmd) wait(statec chan<- *os.ProcessState, cmd *exec.Cmd) {
 				// Ignore any error from Kill: if cmd.Process has already terminated, we
 				// still want to send ctx.Err() (or the error from Signal) to inform the
 				// caller that we needed to terminate the output pipes.
-				_ = cmd.Process.Kill()
 				if err == nil {
-					err = ctx.Err()
+					err = ErrWaitDelay
 				}
+				_ = cmd.Process.Kill()
 
 				// Close the pipes to which the process writes, in case the process
 				// abandoned any subprocesses that are still running. Terminate the
@@ -261,7 +268,11 @@ func (c *Cmd) wait(statec chan<- *os.ProcessState, cmd *exec.Cmd) {
 	c.runningPipes.Wait()
 
 	if errc != nil {
-		if interruptErr := <-errc; interruptErr != nil {
+		interruptErr := <-errc
+		// If Wait returned an error, prefer that. Otherwise,
+		// report any error from the interrupt goroutine, such
+		// as a Context cancellation or a WaitDelay overrun.
+		if interruptErr != nil && c.err == nil {
 			c.err = interruptErr
 		}
 	}
