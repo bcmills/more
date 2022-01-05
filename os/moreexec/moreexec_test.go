@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -28,6 +29,24 @@ var (
 	subsleep        = flag.Duration("subsleep", 0, "amount of time to leave an orphaned subprocess sleeping with stderr open")
 	probe           = flag.Duration("probe", 0, "if nonzero, period at which to print to stderr to check for liveness")
 )
+
+var exeOnce struct {
+	path string
+	sync.Once
+}
+
+// exePath returns the path to the running executable.
+func exePath() string {
+	exeOnce.Do(func() {
+		var err error
+		exeOnce.path, err = os.Executable()
+		if err != nil {
+			exeOnce.path = os.Args[0]
+		}
+	})
+
+	return exeOnce.path
+}
 
 func TestMain(m *testing.M) {
 	flag.Parse()
@@ -46,13 +65,7 @@ func TestMain(m *testing.M) {
 	}
 
 	if *subsleep != 0 {
-		exe, err := os.Executable()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-
-		cmd := moreexec.Command(exe, "-sleep", subsleep.String(), "-probe", probe.String())
+		cmd := moreexec.Command(exePath(), "-sleep", subsleep.String(), "-probe", probe.String())
 		cmd.Stderr = os.Stderr
 		out, err := cmd.StdoutPipe()
 		if err != nil {
@@ -100,12 +113,7 @@ func TestMain(m *testing.M) {
 func start(t *testing.T, ctx context.Context, interrupt os.Signal, killDelay time.Duration, args ...string) *moreexec.Cmd {
 	t.Helper()
 
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cmd := moreexec.CommandContext(ctx, exe, args...)
+	cmd := moreexec.CommandContext(ctx, exePath(), args...)
 	cmd.Stderr = new(strings.Builder)
 	cmd.Interrupt = interrupt
 	cmd.WaitDelay = killDelay
@@ -170,7 +178,7 @@ func TestWaitContext(t *testing.T) {
 		// This program exits with status 0,
 		// but pretty much always does so during the wait delay.
 		// Since the Cmd itself didn't do anything to stop the process when the
-		// context expired, a successful exit is valid (even though late) and does
+		// context expired, a successful exit is valid (even if late) and does
 		// not merit a non-nil error.
 		if err != nil {
 			t.Errorf("Wait: %v; want %v", err, ctx.Err())

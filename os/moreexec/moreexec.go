@@ -24,6 +24,8 @@ var QuitSignal os.Signal = quitSignal
 
 var ErrWaitDelay = errors.New("moreexec: WaitDelay expired before I/O complete")
 
+// A Cmd is like an exec.Cmd, but with additional fields as proposed in
+// https://go.dev/issue/50436.
 type Cmd struct {
 	Path         string
 	Args         []string
@@ -44,16 +46,24 @@ type Cmd struct {
 	// If Interrupt is non-nil, Context must also be non-nil and Interrupt will be
 	// sent to the child process when Context is done.
 	//
-	// Setting Interrupt to os.Interrupt on Windows is not currently supported,
-	// but may send a CTRL_BREAK_EVENT in a future version.
+	// If the command exits with a success code after the Interrupt signal has
+	// been sent, Wait and similar methods will return Context.Err()
+	// instead of nil.
+	//
+	// If the Interrupt signal is not supported on the current platform
+	// (for example, if it is os.Interrupt on Windows), Start may fail
+	// (and return a non-nil error).
 	Interrupt os.Signal
 
 	// If WaitDelay is non-zero, the command's I/O pipes will be closed after
 	// WaitDelay has elapsed after either the command's process has exited or
 	// (if Context is non-nil) Context is done, whichever occurs first.
-	//
 	// If the command's process is still running after WaitDelay has elapsed,
 	// it will be terminated with os.Kill before the pipes are closed.
+	//
+	// If the command exits with a success code after pipes are closed due to
+	// WaitDelay and no Interrupt signal has been sent, Wait and similar methods
+	// will return ErrWaitDelay instead of nil.
 	//
 	// If WaitDelay is zero (the default), I/O pipes will be read until EOF,
 	// which might not occur until orphaned subprocesses of the command have
